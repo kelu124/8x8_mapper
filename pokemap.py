@@ -7,7 +7,7 @@ shared palette, and the result is written as:
   outputs/<sheet>/pokemon_8x8.json   one object per Pokemon
   outputs/<sheet>/png/NNN_name.png   8x8 RGBA sprite (transparent background)
   outputs/<sheet>/png_x16/NNN_name.png  same, upscaled x16 (nearest neighbour)
-  outputs/<sheet>/sheet.png          contact sheet of all 151 for checking
+  outputs/<sheet>/sheet.png          contact sheet of all sprites, for checking
 """
 import json
 from pathlib import Path
@@ -35,15 +35,23 @@ Dragonair Dragonite Mewtwo Mew""".split()
 NAMES = [n.replace("Mr.Mime", "Mr. Mime") for n in NAMES]
 assert len(NAMES) == 151
 
-# Sheet layouts, measured from the images: top-left of the first sprite,
-# distance between sprites, and size of one art pixel (all in image pixels).
+# Sheet layouts, measured from the images. Grid sheets give the top-left of
+# the first sprite, distance between sprites and size of one art pixel (image
+# pixels). Tiled sheets have opaque square tiles separated by dark gutters,
+# which are found automatically.
 SHEETS = {
     "spa-zone_16colors": dict(
         path="art/all-151-gen-1-pokemon-as-8x8-pixel-art-with-16-colors-v0-wfnbxtpk9owf1.webp",
         cols=12, origin=(10, 10), pitch=(89, 89), cell=10),
     "kanto": dict(
-        path="art/kanto-pokémon-sprites-8x8-v0-6q13qraf7e191.webp",
+        path="art/6q13qraf7e191.png",
         cols=10, origin=(20, 0), pitch=(100, 100), cell=10),
+    # Gen 9 face icons. The sheet holds 139 tiles, which does not match the
+    # 120 Gen 9 Pokemon, so entries are numbered but not named. It is a small
+    # JPEG, so colours are merged more coarsely.
+    "paldea": dict(
+        path="art/images.jpeg",
+        tiled=True, count=139, names=None, transparent=False, merge=70),
 }
 
 BG_DIST = 40       # colour distance below which a cell counts as background
@@ -51,25 +59,44 @@ MERGE_DIST = 28    # colours closer than this are merged into one palette entry
 DIGITS = "0123456789abcdefghijklmnopqrstuvwxyz"
 
 
-def sample_sprite(a, x0, y0, cell):
-    """Return an 8x8x3 array: median colour of the inner part of each cell."""
-    m = cell // 4
+def sample_sprite(a, x0, y0, w, h):
+    """Return an 8x8x3 array: median colour of the inner half of each cell."""
+    cw, ch = w / 8, h / 8
     out = np.zeros((8, 8, 3))
     for r in range(8):
         for c in range(8):
-            y, x = y0 + r * cell, x0 + c * cell
-            block = a[y + m:y + cell - m, x + m:x + cell - m].reshape(-1, 3)
+            y, x = y0 + (r + .5) * ch, x0 + (c + .5) * cw
+            block = a[int(y - ch / 4):int(y + ch / 4) + 1,
+                      int(x - cw / 4):int(x + cw / 4) + 1].reshape(-1, 3)
             out[r, c] = np.median(block, axis=0)
     return out
 
 
-def build_palette(colours):
+def grid_boxes(cols, origin, pitch, cell, count):
+    for i in range(count):
+        r, c = divmod(i, cols)
+        yield origin[0] + c * pitch[0], origin[1] + r * pitch[1], 8 * cell, 8 * cell
+
+
+def tile_boxes(a, count, gutter=150):
+    """Find tiles as the bright runs of the mean column/row brightness."""
+    def runs(profile):
+        on = np.concatenate([[False], profile > gutter, [False]])
+        edges = np.flatnonzero(on[1:] != on[:-1])
+        return list(zip(edges[::2], edges[1::2]))
+    g = a.sum(2)
+    xs, ys = runs(g.mean(0)), runs(g.mean(1))
+    boxes = [(x0, y0, x1 - x0, y1 - y0) for y0, y1 in ys for x0, x1 in xs]
+    return boxes[:count]
+
+
+def build_palette(colours, merge=MERGE_DIST):
     """Greedy clustering of sampled colours, most frequent first."""
     uniq, counts = np.unique(np.round(colours).astype(int), axis=0, return_counts=True)
     clusters = []  # [sum, weight]
     for col, n in sorted(zip(uniq, counts), key=lambda t: -t[1]):
         for cl in clusters:
-            if np.abs(cl[0] / cl[1] - col).sum() < MERGE_DIST:
+            if np.abs(cl[0] / cl[1] - col).sum() < merge:
                 cl[0] = cl[0] + col * n
                 cl[1] += n
                 break
@@ -82,17 +109,19 @@ def hexcol(c):
     return "#%02x%02x%02x" % tuple(int(v) for v in c)
 
 
-def process(key, path, cols, origin, pitch, cell):
+def process(key, path, count=151, names=NAMES, transparent=True, tiled=False,
+            cols=12, merge=MERGE_DIST, **grid):
     a = np.asarray(Image.open(path).convert("RGB")).astype(float)
     bg = np.median(a.reshape(-1, 3), axis=0)
 
-    grids = []
-    for i in range(151):
-        r, c = divmod(i, cols)
-        grids.append(sample_sprite(a, origin[0] + c * pitch[0], origin[1] + r * pitch[1], cell))
-    grids = np.array(grids)                                   # 151x8x8x3
-    opaque = np.abs(grids - bg).sum(-1) > BG_DIST              # 151x8x8
-    palette = build_palette(grids[opaque])
+    boxes = tile_boxes(a, count) if tiled else grid_boxes(cols=cols, count=count, **grid)
+    grids = np.array([sample_sprite(a, *b) for b in boxes])   # Nx8x8x3
+    assert len(grids) == count, f"{key}: found {len(grids)} sprites, expected {count}"
+    if transparent:
+        opaque = np.abs(grids - bg).sum(-1) > BG_DIST          # Nx8x8
+    else:
+        opaque = np.ones(grids.shape[:3], dtype=bool)
+    palette = build_palette(grids[opaque], merge)
     idx = np.abs(grids[..., None, :] - palette).sum(-1).argmin(-1)
 
     out = Path("outputs") / key
@@ -101,7 +130,8 @@ def process(key, path, cols, origin, pitch, cell):
     rgba_pal = np.concatenate([palette, np.full((len(palette), 1), 255)], axis=1)
 
     records, tiles = [], []
-    for i, name in enumerate(NAMES):
+    for i in range(count):
+        name = names[i] if names else None
         used = sorted(set(idx[i][opaque[i]].tolist()))
         assert len(used) <= len(DIGITS), f"{name}: too many colours"
         local = {g: n for n, g in enumerate(used)}
@@ -117,7 +147,7 @@ def process(key, path, cols, origin, pitch, cell):
         rgba = np.zeros((8, 8, 4), dtype=np.uint8)
         rgba[opaque[i]] = rgba_pal[idx[i][opaque[i]]]
         img = Image.fromarray(rgba, "RGBA")
-        fname = "%03d_%s.png" % (i + 1, slug(name))
+        fname = "%03d_%s.png" % (i + 1, slug(name)) if name else "%03d.png" % (i + 1)
         img.save(out / "png" / fname)
         img.resize((128, 128), Image.Resampling.NEAREST).save(out / "png_x16" / fname)
         tiles.append(img)
@@ -132,7 +162,7 @@ def process(key, path, cols, origin, pitch, cell):
         }, f, ensure_ascii=False, indent=1)
 
     contact_sheet(tiles, cols, bg).save(out / "sheet.png")
-    print(f"{key}: 151 sprites, {len(palette)} colours -> {out}")
+    print(f"{key}: {count} sprites, {len(palette)} colours -> {out}")
 
 
 def contact_sheet(tiles, cols, bg, scale=8, gap=2):
