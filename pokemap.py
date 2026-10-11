@@ -52,6 +52,24 @@ SHEETS = {
     "paldea": dict(
         path="art/images.jpeg",
         tiled=True, count=139, names=None, transparent=False, merge=70),
+    # Free-form sheet: sprites of varying size (up to 13x9) on a white page,
+    # 8 image pixels per art pixel, one row of sprites every 10 art pixels.
+    # Sprites are cut out, centred on a square canvas and shrunk to 8x8.
+    # Krabby and Kingler (#98, #99) are not on the sheet. White parts of
+    # sprites (e.g. Seel, Dewgong) cannot be told from the page and are lost.
+    "alt151": dict(
+        path="art/e483328b4a83dc325eac4f3f459d20d7.jpg",
+        ids=[i for i in range(1, 152) if i not in (98, 99)], merge=50,
+        freeform=dict(unit=8, band=10, rows=13, cuts={
+            # Art-pixel column ranges for rows where sprites are split into
+            # pieces (merged here) or touch each other (split here).
+            7: [(1, 11), (16, 19), (25, 28), (29, 38), (39, 49), (50, 59), (61, 69),
+                (70, 77), (78, 86), (87, 95), (96, 102), (103, 109), (111, 116)],
+            9: [(1, 9), (10, 17), (18, 25), (26, 33), (34, 41), (44, 57), (58, 65),
+                (66, 75), (76, 85), (86, 93), (94, 101), (102, 108), (109, 116)],
+            11: [(1, 13), (14, 22), (23, 34), (34, 45), (46, 54), (55, 61), (62, 70),
+                 (71, 77), (78, 88), (89, 99), (100, 110)],
+        })),
 }
 
 BG_DIST = 40       # colour distance below which a cell counts as background
@@ -90,6 +108,40 @@ def tile_boxes(a, count, gutter=150):
     return boxes[:count]
 
 
+def runs(on):
+    """[start, end) ranges of the True stretches of a 1-D boolean array."""
+    edges = np.flatnonzero(np.diff(np.concatenate([[0], on.astype(int), [0]])))
+    return list(zip(edges[::2], edges[1::2]))
+
+
+def freeform_sprites(a, unit, band, rows, cuts, white=720):
+    """Cut variable-size sprites from a white page and fit each into 8x8.
+
+    Returns (Nx8x8x3 colours, Nx8x8 opaque mask, list of native sizes)."""
+    s = a[unit // 2::unit, unit // 2::unit]          # one sample per art pixel
+    ink = s.sum(-1) < white
+    grids, masks, sizes = [], [], []
+    for b in range(rows):
+        top = b * band
+        for x0, x1 in cuts.get(b) or runs(ink[top:top + band].any(0)):
+            m = ink[top:top + band, x0:x1]
+            y0, y1 = runs(m.any(1))[0][0], runs(m.any(1))[-1][1]
+            m, col = m[y0:y1], s[top + y0:top + y1, x0:x1]
+            h, w = m.shape
+            n = max(h, w, 8)
+            # centre on an n x n canvas, then nearest-neighbour sample to 8x8
+            canvas_m = np.zeros((n, n), bool)
+            canvas_c = np.zeros((n, n, 3))
+            oy, ox = (n - h) // 2, (n - w) // 2
+            canvas_m[oy:oy + h, ox:ox + w] = m
+            canvas_c[oy:oy + h, ox:ox + w] = col
+            pick = ((np.arange(8) + .5) * n / 8).astype(int)
+            grids.append(canvas_c[pick][:, pick])
+            masks.append(canvas_m[pick][:, pick])
+            sizes.append([int(w), int(h)])
+    return np.array(grids), np.array(masks), sizes
+
+
 def build_palette(colours, merge=MERGE_DIST):
     """Greedy clustering of sampled colours, most frequent first."""
     uniq, counts = np.unique(np.round(colours).astype(int), axis=0, return_counts=True)
@@ -109,18 +161,24 @@ def hexcol(c):
     return "#%02x%02x%02x" % tuple(int(v) for v in c)
 
 
-def process(key, path, count=151, names=NAMES, transparent=True, tiled=False,
-            cols=12, merge=MERGE_DIST, **grid):
+def process(key, path, count=151, ids=None, names=NAMES, transparent=True,
+            tiled=False, freeform=None, cols=12, merge=MERGE_DIST, **grid):
     a = np.asarray(Image.open(path).convert("RGB")).astype(float)
     bg = np.median(a.reshape(-1, 3), axis=0)
+    ids = ids or list(range(1, count + 1))
+    count, sizes = len(ids), None
 
-    boxes = tile_boxes(a, count) if tiled else grid_boxes(cols=cols, count=count, **grid)
-    grids = np.array([sample_sprite(a, *b) for b in boxes])   # Nx8x8x3
-    assert len(grids) == count, f"{key}: found {len(grids)} sprites, expected {count}"
-    if transparent:
-        opaque = np.abs(grids - bg).sum(-1) > BG_DIST          # Nx8x8
+    if freeform:
+        grids, opaque, sizes = freeform_sprites(a, **freeform)
     else:
-        opaque = np.ones(grids.shape[:3], dtype=bool)
+        boxes = tile_boxes(a, count) if tiled else grid_boxes(cols=cols, count=count, **grid)
+        grids = np.array([sample_sprite(a, *b) for b in boxes])   # Nx8x8x3
+    assert len(grids) == count, f"{key}: found {len(grids)} sprites, expected {count}"
+    if not freeform:
+        if transparent:
+            opaque = np.abs(grids - bg).sum(-1) > BG_DIST      # Nx8x8
+        else:
+            opaque = np.ones(grids.shape[:3], dtype=bool)
     palette = build_palette(grids[opaque], merge)
     idx = np.abs(grids[..., None, :] - palette).sum(-1).argmin(-1)
 
@@ -131,23 +189,25 @@ def process(key, path, count=151, names=NAMES, transparent=True, tiled=False,
 
     records, tiles = [], []
     for i in range(count):
-        name = names[i] if names else None
+        name = names[ids[i] - 1] if names else None
         used = sorted(set(idx[i][opaque[i]].tolist()))
         assert len(used) <= len(DIGITS), f"{name}: too many colours"
         local = {g: n for n, g in enumerate(used)}
         rows = ["".join(DIGITS[local[idx[i, r, c]]] if opaque[i, r, c] else "."
                         for c in range(8)) for r in range(8)]
         records.append({
-            "id": i + 1,
+            "id": ids[i],
             "name": name,
             "palette": [hexcol(palette[g]) for g in used],
             "pixels": rows,
         })
+        if sizes:
+            records[-1]["native_size"] = sizes[i]
 
         rgba = np.zeros((8, 8, 4), dtype=np.uint8)
         rgba[opaque[i]] = rgba_pal[idx[i][opaque[i]]]
         img = Image.fromarray(rgba, "RGBA")
-        fname = "%03d_%s.png" % (i + 1, slug(name)) if name else "%03d.png" % (i + 1)
+        fname = "%03d_%s.png" % (ids[i], slug(name)) if name else "%03d.png" % ids[i]
         img.save(out / "png" / fname)
         img.resize((128, 128), Image.Resampling.NEAREST).save(out / "png_x16" / fname)
         tiles.append(img)
